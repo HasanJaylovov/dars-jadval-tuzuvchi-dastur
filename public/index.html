@@ -1,0 +1,147 @@
+
+<!doctype html>
+<html lang="uz">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dars jadvali — Excel rejimi</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:Arial,Helvetica,sans-serif;background:#eef2f6;color:#17202a}
+.top{background:#17202a;color:#fff;padding:16px 20px;position:sticky;top:0;z-index:30;box-shadow:0 2px 8px #0002}
+.top h1{margin:0 0 5px;font-size:22px}.top small{opacity:.8}
+.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px;background:#fff;border-bottom:1px solid #ccd4dc;position:sticky;top:75px;z-index:25}
+button,.file{padding:9px 13px;border:1px solid #b8c2cc;border-radius:6px;background:#fff;cursor:pointer}.primary{background:#1769aa;color:#fff;border-color:#1769aa}.warn{background:#fff4ce;border-color:#e3c44d}
+input[type=file]{display:none}select{padding:8px;border:1px solid #b8c2cc;border-radius:6px;background:#fff}
+.status{margin-left:auto;color:#657381}
+.main{padding:10px}.sheet-wrap{height:calc(100vh - 125px);min-height:500px;border:1px solid #aeb8c2;background:#fff;overflow:auto;position:relative}
+.grid{border-collapse:separate;border-spacing:0;table-layout:fixed;background:#fff}
+.grid th,.grid td{border-right:1px solid #d7dde3;border-bottom:1px solid #d7dde3;padding:2px 5px;height:22px;min-width:90px;white-space:pre-wrap;overflow:hidden;vertical-align:middle}
+.grid .corner,.grid .rh,.grid .ch{background:#edf1f5;color:#3f4a55;font-weight:normal;text-align:center;position:sticky;z-index:12}
+.grid .corner{left:0;top:0;width:46px;min-width:46px}.grid .rh{left:0;width:46px;min-width:46px}.grid .ch{top:0}
+.grid td{font-size:12px}.grid .selected{outline:2px solid #1677d2;outline-offset:-2px;background:#eaf3ff!important}
+.grid .changed{background:#e9f9ed!important}
+.grid .blocked{background:#ffe9e9!important}
+.panel{background:#fff;border:1px solid #ccd4dc;border-radius:8px;margin:10px 0;padding:12px}
+.hidden{display:none}.danger{color:#b42318}.ok{color:#067647}.item{border-left:4px solid #d92d20;background:#fff5f4;margin:8px 0;padding:10px;border-radius:6px}
+.warning{border-left:4px solid #d99a00;background:#fff9e8;margin:8px 0;padding:10px;border-radius:6px}
+.pill{display:inline-block;padding:5px 8px;border-radius:5px;background:#e9f8ee;color:#067647;margin:3px;cursor:pointer}
+.movebar{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:8px}
+@media(max-width:700px){.toolbar{top:62px}.status{width:100%;margin:0}.sheet-wrap{height:calc(100vh - 145px)}}
+</style>
+</head>
+<body>
+<div class="top"><h1>📅 DARS JADVALI — Excel rejimi</h1><small>Satrlari, ustunlari, birlashtirilgan kataklari va asosiy formatlari bilan spreadsheet ko‘rinishi</small></div>
+<div class="toolbar">
+<label class="file">📥 Excel yuklash<input id="file" type="file" accept=".xlsx,.xls"></label>
+<select id="sheet" disabled></select>
+<button id="check" class="primary" disabled>🔍 Tekshirish</button>
+<button id="export" disabled>📤 Natijani Excel qilib yuklash</button>
+<span id="status" class="status">Excel faylini yuklang</span>
+</div>
+<div class="main">
+<div id="alerts" class="panel hidden"></div>
+<div id="sheetWrap" class="sheet-wrap">
+<table id="grid" class="grid"></table>
+</div>
+</div>
+<script>
+let data=null, current=null, originalFile=null, moves=[], lessonsById=new Map(), blockRows={};
+
+const $=x=>document.getElementById(x);
+$("file").addEventListener("change",async e=>{
+  const f=e.target.files[0];if(!f)return;originalFile=f;
+  const fd=new FormData();fd.append("file",f);
+  $("status").textContent="Excel o‘qilmoqda...";
+  try{const r=await fetch("/api/upload",{method:"POST",body:fd});data=await r.json();if(!r.ok)throw Error(data.error);
+    $("sheet").disabled=false;$("check").disabled=false;$("export").disabled=false;
+    $("sheet").innerHTML=data.sheets.map((s,i)=>`<option value="${i}">${esc(s.name)}</option>`).join("");
+    render();$("status").textContent=`✓ ${data.sheets.length} ta jadval varaqi o‘qildi`;
+  }catch(e){$("status").textContent="❌ "+e.message}
+});
+$("sheet").addEventListener("change",render);
+$("check").addEventListener("click",check);
+$("export").addEventListener("click",exportExcel);
+
+function render(){
+  current=data.sheets[Number($("sheet").value)];
+  lessonsById=new Map(current.lessons.map(x=>[x.id,x]));
+  const v=current.view, map={};
+  v.cells.forEach(c=>map[`${c.r},${c.c}`]=c);
+  let html="<thead><tr><th class='corner'></th>";
+  for(let c=1;c<=v.maxCol;c++)html+=`<th class="ch" style="width:${(v.colWidths[c-1]||10)*7}px">${col(c)}</th>`;
+  html+="</tr></thead><tbody>";
+  for(let r=1;r<=v.maxRow;r++){
+    html+=`<tr><th class="rh">${r}</th>`;
+    for(let c=1;c<=v.maxCol;c++){
+      const x=map[`${r},${c}`]||{v:"",s:{font:{},fill:{},align:{},border:{}}};
+      html+=`<td data-r="${r}" data-c="${c}" style="${css(x.s)}">${esc(x.v)}</td>`;
+    }
+    html+="</tr>";
+  }
+  html+="</tbody>";$("grid").innerHTML=html;
+  $("alerts").classList.add("hidden");
+  $("grid").querySelectorAll("td").forEach(td=>td.addEventListener("click",()=>selectCell(td)));
+}
+function css(s){
+  s=s||{};let f=s.font||{},a=s.align||{},fill=s.fill||{},b=s.border||{};
+  let z=`font-family:${f.name||"Arial"};font-size:${f.size||11}px;${f.bold?"font-weight:700;":""}${f.italic?"font-style:italic;":""}${f.underline?"text-decoration:underline;":""}`;
+  if(f.color)z+=`color:${f.color};`; if(fill.color)z+=`background:${fill.color};`;
+  if(a.horizontal)z+=`text-align:${a.horizontal};`;if(a.vertical)z+=`vertical-align:${a.vertical};`;if(a.wrap)z+="white-space:pre-wrap;";
+  if(b.top?.style)z+="border-top:1px solid #9aa4ae;";if(b.bottom?.style)z+="border-bottom:1px solid #9aa4ae;";
+  if(b.left?.style)z+="border-left:1px solid #9aa4ae;";if(b.right?.style)z+="border-right:1px solid #9aa4ae;";
+  return z;
+}
+function selectCell(td){$("grid").querySelectorAll(".selected").forEach(x=>x.classList.remove("selected"));td.classList.add("selected")}
+function col(n){let s="";while(n){let m=(n-1)%26;s=String.fromCharCode(65+m)+s;n=Math.floor((n-1)/26)}return s}
+function esc(x){return String(x??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]))}
+
+async function check(){
+  const r=await fetch("/api/check",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({lessons:current.lessons})});
+  const d=await r.json();const box=$("alerts");box.classList.remove("hidden");
+  let h=`<h2>${d.count?"🔴":"🟢"} Konfliktlar: ${d.count} ta</h2>`;
+  if(d.warnings.length)h+=`<h3 class="danger">⏱ Dars soati bo‘yicha ogohlantirishlar: ${d.warnings.length} ta</h3>`+
+    d.warnings.map(w=>`<div class="warning">⚠️ <b>${esc(w.className)}</b> — ${esc(w.day)}: <b>${w.count} soat</b>. Bu sinf uchun limit <b>${w.max} soat</b>. ${w.max===5?"1–4-sinflar uchun bir kunda 5 soatdan ortiq dars mumkin emas.":"5-sinf va undan yuqori uchun bir kunda 6 soatdan ortiq dars mumkin emas."}</div>`).join("");
+  if(d.count)h+=d.conflicts.map((c,i)=>`<div class="item"><b>⚠️ ${c.type==="teacher"?"O‘qituvchi paralelligi":"Sinf paralelligi"}</b><br>
+  ${c.type==="teacher"?`👨‍🏫 ${esc(c.teacherName)}`:`🏫 ${esc(c.className)}`} — ${esc(c.day)}, ${c.period}-dars
+  <ul>${c.lessons.map(l=>`<li><b>${esc(l.className)}</b> — ${esc(l.subject)} — ${esc(l.teacherNames.join(", ")||l.teacherRaw)}</li>`).join("")}</ul>
+  <b>💡 Ko‘chirish uchun bo‘sh variantlar:</b><div class="movebar">${c.suggestions.map(s=>`<button class="pill" onclick="chooseMove('${esc(c.lessons[0].id)}','${esc(s.day)}',${s.period})">🟢 ${esc(s.day)} — ${s.period}-darsga ko‘chirish</button>`).join("")||"Mos variant topilmadi."}</div>
+  </div>`).join("");
+  else if(!d.warnings.length)h+="<p class='ok'>Jadvalda o‘qituvchi yoki sinf paralelligi topilmadi.</p>";
+  box.innerHTML=h;
+}
+window.chooseMove=function(id,day,period){
+  const l=lessonsById.get(id);if(!l)return;
+  // Find target row by the same day block and period using visible worksheet rows.
+  const rows=current.view.cells.filter(c=>c.c===2 && String(c.v)===String(period)).map(c=>c.r);
+  let target=null;
+  for(const r of rows){
+    const a=current.view.cells.find(c=>c.r===r&&c.c===1);
+    const label=a?String(a.v).trim():"";
+    const dname=({D:"Dushanba",U:"Seshanba",SH:"Chorshanba",A:"Payshanba",N:"Juma",B:"Shanba",S:"Yakshanba",E:"Yakshanba"})[label]||label;
+    if(dname===day){target=r;break}
+  }
+  if(!target){alert("Bu kun/dars uchun Excel satri topilmadi.");return}
+  moves.push({...l,targetRow:target});
+  // Visual update: clear source pair, place values in target pair.
+  const src1=document.querySelector(`td[data-r="${l.row}"][data-c="${l.teacherCol}"]`);
+  const src2=document.querySelector(`td[data-r="${l.row}"][data-c="${l.subjectCol}"]`);
+  const dst1=document.querySelector(`td[data-r="${target}"][data-c="${l.teacherCol}"]`);
+  const dst2=document.querySelector(`td[data-r="${target}"][data-c="${l.subjectCol}"]`);
+  if(dst1?.textContent.trim()||dst2?.textContent.trim()){alert("Tanlangan vaqt Excel jadvalida band ko‘rinmoqda.");moves.pop();return}
+  if(src1)src1.textContent="";if(src2)src2.textContent="";
+  if(dst1)dst1.textContent=l.teacherRaw;if(dst2)dst2.textContent=l.subject;
+  [src1,src2,dst1,dst2].forEach(x=>x?.classList.add("changed"));
+  $("status").textContent=`✓ ${l.className} — ${l.subject} ko‘chirildi. Excel eksport qilish mumkin.`;
+}
+async function exportExcel(){
+  if(!originalFile){alert("Avval Excel yuklang.");return}
+  const fd=new FormData();fd.append("original",originalFile);fd.append("moves",JSON.stringify(moves));
+  $("status").textContent="Excel tayyorlanmoqda...";
+  const r=await fetch("/api/export",{method:"POST",body:fd});
+  if(!r.ok){const d=await r.json();$("status").textContent="❌ "+d.error;return}
+  const blob=await r.blob(), url=URL.createObjectURL(blob), a=document.createElement("a");
+  a.href=url;a.download="dars_jadvali_natija.xlsx";a.click();URL.revokeObjectURL(url);
+  $("status").textContent="✓ Natijaviy Excel yuklashga tayyor.";
+}
+</script>
+</body>
+</html>

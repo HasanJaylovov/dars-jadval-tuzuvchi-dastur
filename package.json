@@ -1,0 +1,12 @@
+{
+  "name": "dars-jadvali-excel-v2",
+  "version": "2.0.0",
+  "description": "Excel ko‘rinishidagi dars jadvali, konflikt tekshiruvi, ko‘chirish va Excel eksport",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "express": "^4.21.2",
+    "multer": "^1.4.5-lts.1",
+    "exceljs": "^4.4.0"
+  }
+}
