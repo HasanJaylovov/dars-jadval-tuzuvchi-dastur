@@ -1,228 +1,227 @@
+import express from "express";
+import cors from "cors";
+import multer from "multer";
+import ExcelJS from "exceljs";
+import path from "path";
+import fs from "fs";
+import crypto from "crypto";
+import { fileURLToPath } from "url";
 
-const express = require("express");
-const multer = require("multer");
-const ExcelJS = require("exceljs");
-const path = require("path");
-const fs = require("fs");
-
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
-const upload = multer({ dest: path.join(__dirname, "uploads") });
-app.use(express.json({limit:"10mb"}));
-app.use(express.static(path.join(__dirname,"public")));
+const uploadDir = path.join(__dirname, "uploads");
+fs.mkdirSync(uploadDir, { recursive: true });
 
-function clean(v){ return v === null || v === undefined ? "" : String(v).trim(); }
-function teacherIds(v){
-  return clean(v).replace(/\s+/g,"").split(/[\\/,;|]+/).filter(Boolean);
-}
-function cellValue(cell){
-  if(cell.value === null || cell.value === undefined) return "";
-  if(typeof cell.value === "object"){
-    if(cell.value.text) return cell.value.text;
-    if(cell.value.result !== undefined) return String(cell.value.result);
+app.use(cors({ origin: "*" }));
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, "public")));
+
+const storage = multer.diskStorage({
+  destination: uploadDir,
+  filename: (req, file, cb) => cb(null, `jadval-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.xlsx`)
+});
+const upload = multer({
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (ext === ".xlsx") cb(null, true);
+    else cb(new Error("Faqat .xlsx formatidagi Excel fayl qabul qilinadi."));
   }
-  return String(cell.value);
+});
+
+const sessions = new Map();
+
+function normalizeCellValue(value) {
+  if (value === undefined || value === null) return "";
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "object") {
+    if (Array.isArray(value.richText)) return value.richText.map(x => x?.text || "").join("");
+    if (Object.prototype.hasOwnProperty.call(value, "result")) return normalizeCellValue(value.result);
+    if (value.text !== undefined) return String(value.text);
+    if (value.hyperlink) return String(value.hyperlink);
+    if (value.error) return String(value.error);
+    return "";
+  }
+  return String(value);
 }
-function colLetter(n){
-  let s="";
-  while(n){let m=(n-1)%26;s=String.fromCharCode(65+m)+s;n=Math.floor((n-1)/26);}
-  return s;
-}
-function rgb(color){
-  if(!color) return null;
-  if(color.argb) return "#"+color.argb.slice(-6);
-  if(color.rgb) return "#"+color.rgb.slice(-6);
-  return null;
-}
-function styleJSON(cell){
-  const f=cell.font||{}, fill=cell.fill||{}, a=cell.alignment||{}, b=cell.border||{};
-  const side=x=>x?{style:x.style||null,color:rgb(x.color)}:null;
+
+async function readExcel(filePath) {
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.readFile(filePath);
   return {
-    font:{name:f.name||"Arial",size:f.size||11,bold:!!f.bold,italic:!!f.italic,underline:!!f.underline,color:rgb(f.color)},
-    fill:{type:fill.type||null,color:rgb(fill.fgColor),bg:rgb(fill.bgColor)},
-    align:{horizontal:a.horizontal||null,vertical:a.vertical||null,wrap:!!a.wrapText,textRotation:a.textRotation||0,indent:a.indent||0},
-    border:{top:side(b.top),bottom:side(b.bottom),left:side(b.left),right:side(b.right)}
+    sheets: workbook.worksheets.map(ws => {
+      const rows = [];
+      const max = Math.max(ws.columnCount || 0, 1);
+      for (let r = 1; r <= (ws.rowCount || 1); r++) {
+        const row = [];
+        for (let c = 1; c <= max; c++) row.push(normalizeCellValue(ws.getCell(r, c).value));
+        rows.push(row);
+      }
+      return { name: ws.name, rowCount: ws.rowCount || rows.length, columnCount: max, rows };
+    })
   };
 }
-function sheetJSON(ws){
-  const cells=[];
-  const maxRow=ws.rowCount, maxCol=ws.columnCount;
-  for(let r=1;r<=maxRow;r++){
-    for(let c=1;c<=maxCol;c++){
-      const cell=ws.getCell(r,c);
-      const value=cellValue(cell);
-      const hasStyle=cell.style && (cell.style.font || cell.style.fill || cell.style.border || cell.style.alignment);
-      if(value!=="" || hasStyle){
-        cells.push({
-          r,c,v:value,s:styleJSON(cell),
-          w:ws.getColumn(c).width||10,
-          h:ws.getRow(r).height||15
-        });
+
+function looksLikeTeacherId(value) {
+  const s = String(value ?? "").trim();
+  return /^\d{1,4}$/.test(s);
+}
+function clean(v) { return String(v ?? "").trim(); }
+function sameTeacher(a, b) { return clean(a) !== "" && clean(a) === clean(b) && looksLikeTeacherId(a); }
+
+// Generic parser for the real workbook: schedule blocks normally use
+// [teacher ID, subject] pairs, with class name one row above the pair.
+function detectConflicts(sheet) {
+  const rows = sheet.rows || [];
+  const conflicts = [];
+  const slots = new Map();
+
+  // Find teacher-ID cells and infer their class from nearby header rows.
+  for (let r = 0; r < rows.length; r++) {
+    const period = clean(rows[r]?.[1]);
+    if (!/^\d{1,2}$/.test(period)) continue;
+    const day = clean(rows[r]?.[0]);
+    if (!day) continue;
+
+    for (let c = 0; c < (rows[r]?.length || 0); c++) {
+      const teacher = clean(rows[r]?.[c]);
+      if (!looksLikeTeacherId(teacher)) continue;
+      const subject = clean(rows[r]?.[c + 1]);
+      if (!subject) continue;
+
+      let className = "";
+      for (let rr = Math.max(0, r - 3); rr < r; rr++) {
+        const candidate = clean(rows[rr]?.[c]);
+        if (candidate && /sinf/i.test(candidate)) className = candidate;
       }
-    }
-  }
-  const merges=[...ws.model.merges||[]];
-  return {
-    name:ws.name,maxRow,maxCol,cells,merges,
-    colWidths:Array.from({length:maxCol},(_,i)=>ws.getColumn(i+1).width||10),
-    rowHeights:Array.from({length:maxRow},(_,i)=>ws.getRow(i+1).height||15),
-    views:ws.views||[]
-  };
-}
-function parseTeachers(wb){
-  const ws=wb.getWorksheet("Лист2");
-  const map={};
-  if(!ws) return map;
-  ws.eachRow(row=>{
-    for(let c=1;c<row.cellCount;c++){
-      const id=clean(row.getCell(c).value);
-      const name=clean(row.getCell(c+1).value);
-      if(/^\d+$/.test(id) && name && !map[id]) map[id]=name;
-    }
-  });
-  return map;
-}
-function classColumns(ws){
-  const out=[];
-  for(let c=1;c<=ws.columnCount;c++){
-    const v=clean(ws.getCell(3,c).value);
-    if(v && /sinf/i.test(v)) out.push({col:c,className:v});
-  }
-  if(!out.length){
-    for(let r=1;r<=Math.min(ws.rowCount,8);r++){
-      for(let c=1;c<=ws.columnCount;c++){
-        const v=clean(ws.getCell(r,c).value);
-        if(v && /sinf/i.test(v)) out.push({col:c,className:v});
-      }
-      if(out.length) break;
-    }
-  }
-  return out;
-}
-function parseLessons(ws, teachers){
-  const cols=classColumns(ws), lessons=[];
-  // The school files repeat blocks whose first two columns are day code + lesson number.
-  // A lesson block starts whenever column B is 1 and the next rows contain 2 and 3.
-  for(let r=1;r<=ws.rowCount-2;r++){
-    const a=clean(ws.getCell(r,1).value), b=clean(ws.getCell(r,2).value);
-    const b2=clean(ws.getCell(r+1,2).value), b3=clean(ws.getCell(r+2,2).value);
-    if(b==="1" && b2==="2" && b3==="3"){
-      // For each block use up to 7 visible periods, but only rows with real lesson numbers.
-      let day = ({D:"Dushanba",U:"Seshanba",SH:"Chorshanba",A:"Payshanba",N:"Juma",B:"Shanba",S:"Yakshanba",E:"Yakshanba"})[a] || a || `Kun ${r}`;
-      for(let i=0;i<7 && r+i<=ws.rowCount;i++){
-        const rr=r+i, period=Number(clean(ws.getCell(rr,2).value));
-        if(!period) continue;
-        for(const cc of cols){
-          const teacherRaw=clean(ws.getCell(rr,cc.col).value);
-          const subject=clean(ws.getCell(rr,cc.col+1).value);
-          if(!teacherRaw && !subject) continue;
-          const ids=teacherIds(teacherRaw);
-          lessons.push({
-            id:`${ws.name}__${rr}__${cc.col}`,
-            sheet:ws.name,row:rr,teacherCol:cc.col,subjectCol:cc.col+1,
-            day,period,className:cc.className,subject,teacherRaw,teacherIds:ids,
-            teacherNames:ids.map(id=>teachers[id]||`ID ${id}`)
-          });
+      // Most sheets have class headers two rows above; merged headers can put it in c-1.
+      if (!className) {
+        for (let rr = Math.max(0, r - 3); rr < r; rr++) {
+          for (const cc of [c, c - 1, c + 1]) {
+            const candidate = clean(rows[rr]?.[cc]);
+            if (candidate && /sinf/i.test(candidate)) { className = candidate; break; }
+          }
+          if (className) break;
         }
       }
+      const key = `${day.toUpperCase()}|${period}|${teacher}`;
+      const item = { row: r, col: c, teacherId: teacher, subject, className: className || `ustun ${c + 1}` };
+      if (!slots.has(key)) slots.set(key, []);
+      slots.get(key).push(item);
     }
   }
-  return lessons;
-}
-async function readWorkbook(filePath){
-  const wb=new ExcelJS.Workbook();
-  await wb.xlsx.readFile(filePath);
-  const teachers=parseTeachers(wb);
-  const sheets=wb.worksheets.map(ws=>({name:ws.name, view:sheetJSON(ws), lessons:parseLessons(ws,teachers)}));
-  return {sheets,teachers};
-}
-function detect(lessons){
-  const conflicts=[];
-  const byTeacher=new Map(), byClass=new Map();
-  for(const l of lessons){
-    for(const t of l.teacherIds){
-      const k=`${t}|${l.day}|${l.period}`;
-      if(!byTeacher.has(k))byTeacher.set(k,[]);
-      byTeacher.get(k).push(l);
+
+  for (const [key, items] of slots) {
+    if (items.length > 1) {
+      conflicts.push({
+        id: crypto.createHash("md5").update(sheet.name + key).digest("hex").slice(0, 10),
+        type: "teacher",
+        day: key.split("|")[0],
+        period: key.split("|")[1],
+        teacherId: key.split("|")[2],
+        items
+      });
     }
-    const k=`${l.className}|${l.day}|${l.period}`;
-    if(!byClass.has(k))byClass.set(k,[]);
-    byClass.get(k).push(l);
-  }
-  for(const [k,ls] of byTeacher){
-    const classes=[...new Set(ls.map(x=>x.className))];
-    if(classes.length>1){
-      const tid=k.split("|")[0];
-      conflicts.push({type:"teacher",day:ls[0].day,period:ls[0].period,teacherId:tid,
-        teacherName:ls[0].teacherNames[ls[0].teacherIds.indexOf(tid)]||`ID ${tid}`,lessons:ls});
-    }
-  }
-  for(const [k,ls] of byClass){
-    if(ls.length>1) conflicts.push({type:"class",day:ls[0].day,period:ls[0].period,className:ls[0].className,lessons:ls});
   }
   return conflicts;
 }
-function dailyWarnings(lessons){
-  const map=new Map(), warnings=[];
-  for(const l of lessons){
-    const k=`${l.className}|${l.day}`;
-    if(!map.has(k))map.set(k,{className:l.className,day:l.day,set:new Set()});
-    map.get(k).set.add(l.period);
-  }
-  for(const x of map.values()){
-    const m=x.className.match(/(\d+)/), grade=m?Number(m[1]):99;
-    const max=grade<=4?5:6;
-    const count=x.set.size;
-    if(count>max) warnings.push({...x,count,max,type:"daily-limit"});
-  }
-  return warnings;
-}
-function suggestions(lessons, c){
-  const days=[...new Set(lessons.map(x=>x.day))], periods=[...new Set(lessons.map(x=>x.period))].sort((a,b)=>a-b);
-  const out=[];
-  for(const day of days) for(const period of periods){
-    if(day===c.day&&period===c.period)continue;
-    const occ=lessons.filter(x=>x.day===day&&x.period===period);
-    const occC=new Set(occ.map(x=>x.className)), occT=new Set(occ.flatMap(x=>x.teacherIds));
-    const classFree=c.lessons.every(x=>!occC.has(x.className));
-    const teacherFree=c.type!=="teacher" || c.lessons.every(x=>x.teacherIds.every(t=>!occT.has(t)));
-    if(classFree&&teacherFree)out.push({day,period});
-  }
-  return out.slice(0,10);
-}
-app.post("/api/upload",upload.single("file"),async(req,res)=>{
-  try{
-    if(!req.file)return res.status(400).json({error:"Excel fayl yuborilmadi."});
-    const data=await readWorkbook(req.file.path);
-    res.json(data);
-    fs.unlink(req.file.path,()=>{});
-  }catch(e){console.error(e);res.status(500).json({error:"Excel o‘qilmadi.",detail:e.message});}
-});
-app.post("/api/check",(req,res)=>{
-  const lessons=req.body.lessons||[];
-  const conflicts=detect(lessons).map(c=>({...c,suggestions:suggestions(lessons,c)}));
-  res.json({conflicts,warnings:dailyWarnings(lessons),count:conflicts.length});
-});
-app.post("/api/export",upload.single("original"),async(req,res)=>{
-  try{
-    if(!req.file)return res.status(400).json({error:"Original Excel fayl kerak."});
-    const moves=JSON.parse(req.body.moves||"[]");
-    const wb=new ExcelJS.Workbook(); await wb.xlsx.readFile(req.file.path);
-    for(const mv of moves){
-      const ws=wb.getWorksheet(mv.sheet); if(!ws)continue;
-      // Move the complete class lesson pair (teacher + subject) from source row to target row.
-      const sourceRow=Number(mv.row), targetRow=Number(mv.targetRow);
-      const tc=Number(mv.teacherCol), sc=Number(mv.subjectCol);
-      if(!sourceRow||!targetRow||!tc||!sc)continue;
-      const srcTeacher=ws.getCell(sourceRow,tc).value, srcSubject=ws.getCell(sourceRow,sc).value;
-      ws.getCell(sourceRow,tc).value=null; ws.getCell(sourceRow,sc).value=null;
-      ws.getCell(targetRow,tc).value=srcTeacher; ws.getCell(targetRow,sc).value=srcSubject;
+
+function findFreeSlots(sheet, teacherId, sourceCol = null) {
+  const rows = sheet.rows || [];
+  const busyTeacher = new Set();
+  const candidates = [];
+
+  // A teacher is busy if their ID occurs in the same day/period row.
+  for (let r = 0; r < rows.length; r++) {
+    const period = clean(rows[r]?.[1]);
+    const day = clean(rows[r]?.[0]);
+    if (!/^\d{1,2}$/.test(period) || !day) continue;
+    for (let c = 0; c < (rows[r]?.length || 0); c++) {
+      const teacher = clean(rows[r]?.[c]);
+      if (looksLikeTeacherId(teacher)) busyTeacher.add(`${day}|${period}|${teacher}`);
     }
-    const out=path.join(__dirname,"uploads",`dars_jadvali_${Date.now()}.xlsx`);
-    await wb.xlsx.writeFile(out);
-    res.download(out,"dars_jadvali_natija.xlsx",()=>fs.unlink(out,()=>{}));
-    fs.unlink(req.file.path,()=>{});
-  }catch(e){console.error(e);res.status(500).json({error:"Excel yaratishda xato.",detail:e.message});}
+  }
+
+  // The destination must be a genuinely empty lesson cell in the SAME class column
+  // (teacher ID + subject pair). Never overwrite another lesson.
+  for (let r = 0; r < rows.length; r++) {
+    const period = clean(rows[r]?.[1]);
+    const day = clean(rows[r]?.[0]);
+    if (!/^\d{1,2}$/.test(period) || !day) continue;
+    if (busyTeacher.has(`${day}|${period}|${teacherId}`)) continue;
+
+    if (sourceCol !== null && Number.isInteger(sourceCol)) {
+      const teacherCell = clean(rows[r]?.[sourceCol]);
+      const subjectCell = clean(rows[r]?.[sourceCol + 1]);
+      if (teacherCell !== '' || subjectCell !== '') continue;
+      candidates.push({ day, period, row: r, col: sourceCol });
+    } else {
+      candidates.push({ day, period, row: r });
+    }
+  }
+  return candidates.slice(0, 30);
+}
+
+app.get("/api/health", (req, res) => res.json({ ok: true, message: "Dars Jadvali server ishlayapti" }));
+
+app.post("/api/upload", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ ok: false, error: "Fayl tanlanmagan." });
+    const data = await readExcel(req.file.path);
+    const token = crypto.randomBytes(16).toString("hex");
+    sessions.set(token, { path: req.file.path, originalName: req.file.originalname, created: Date.now() });
+    res.json({ ok: true, token, file: { originalName: req.file.originalname, filename: req.file.filename, size: req.file.size }, ...data });
+  } catch (e) {
+    if (req.file?.path) try { fs.unlinkSync(req.file.path); } catch {}
+    res.status(500).json({ ok: false, error: "Excel faylni o'qishda xatolik.", details: e.message });
+  }
 });
-app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"public","index.html")));
-app.listen(PORT,()=>console.log(`Server: http://localhost:${PORT}`));
+
+app.post("/api/check", (req, res) => {
+  try {
+    const sheets = Array.isArray(req.body?.sheets) ? req.body.sheets : req.body?.sheet ? [req.body.sheet] : [];
+    const all = [];
+    for (const sheet of sheets) {
+      for (const c of detectConflicts(sheet)) all.push({ ...c, sheet: sheet.name });
+    }
+    res.json({ ok: true, count: all.length, conflicts: all });
+  } catch (e) { res.status(500).json({ ok: false, error: "Tekshirish xatosi", details: e.message }); }
+});
+
+app.post("/api/suggestions", (req, res) => {
+  const { sheet, teacherId } = req.body || {};
+  if (!sheet || !teacherId) return res.status(400).json({ ok: false, error: "Sheet va Teacher ID kerak." });
+  res.json({ ok: true, suggestions: findFreeSlots(sheet, String(teacherId), Number.isInteger(req.body?.sourceCol) ? req.body.sourceCol : null) });
+});
+
+app.post("/api/export", async (req, res) => {
+  try {
+    const { token, sheets } = req.body || {};
+    const session = sessions.get(token);
+    if (!session || !fs.existsSync(session.path)) return res.status(400).json({ ok: false, error: "Excel sessiyasi topilmadi. Faylni qayta yuklang." });
+    if (!Array.isArray(sheets)) return res.status(400).json({ ok: false, error: "Excel ma'lumotlari yuborilmadi." });
+
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.readFile(session.path);
+    for (const payload of sheets) {
+      const ws = workbook.getWorksheet(payload.name);
+      if (!ws || !Array.isArray(payload.rows)) continue;
+      for (let r = 0; r < payload.rows.length; r++) {
+        const row = payload.rows[r] || [];
+        for (let c = 0; c < row.length; c++) ws.getCell(r + 1, c + 1).value = row[c] === "" ? null : row[c];
+      }
+    }
+    const out = path.join(uploadDir, `dars-jadvali-${Date.now()}.xlsx`);
+    await workbook.xlsx.writeFile(out);
+    res.download(out, "dars_jadvali_natija.xlsx", () => { try { fs.unlinkSync(out); } catch {} });
+  } catch (e) { res.status(500).json({ ok: false, error: "Excel eksportida xatolik.", details: e.message }); }
+});
+
+app.use((req, res) => res.status(404).json({ error: "Endpoint topilmadi.", path: req.path }));
+app.use((err, req, res, next) => { console.error(err); res.status(500).json({ ok: false, error: err.message || "Server xatosi" }); });
+
+app.listen(PORT, () => console.log(`🚀 Dars Jadvali server: http://localhost:${PORT}`));
