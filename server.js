@@ -224,4 +224,4 @@ app.post("/api/export", async (req, res) => {
 app.use((req, res) => res.status(404).json({ error: "Endpoint topilmadi.", path: req.path }));
 app.use((err, req, res, next) => { console.error(err); res.status(500).json({ ok: false, error: err.message || "Server xatosi" }); });
 
-app.listen(PORT, () => console.log(`🚀 Dars Jadvali server: http://localhost:${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Dars Jadvali server running on port ${PORT}`));
